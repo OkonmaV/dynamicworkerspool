@@ -22,6 +22,7 @@ func main(){
 	}, time.Second)
 
     pool.Close()
+    
     //pool.Done()
     _ = pool.DoneWithTimeout(time.Second)
 }
