@@ -6,8 +6,9 @@ import (
 )
 
 var ErrTimeout = errors.New("timed out")
+var ErrClosed = errors.New("pool closed")
 
-type pool struct {
+type Pool struct {
 	tasks_ch     chan func()
 	tasks_dyn_ch chan func()
 
@@ -16,14 +17,14 @@ type pool struct {
 	timeout time.Duration
 }
 
-func NewPool(min_pool_size, max_pool_size int, worker_annihilation_timeout time.Duration) *pool {
+func NewPool(min_pool_size, max_pool_size int, worker_annihilation_timeout time.Duration) *Pool {
 	if min_pool_size > max_pool_size || max_pool_size == 0 {
 		panic("pool sizes error: max size is zero or less than min size")
 	}
 	if max_pool_size != min_pool_size && worker_annihilation_timeout == 0 {
 		panic("max pool size is not equal to min size with zero annihilation timeout")
 	}
-	p := &pool{
+	p := &Pool{
 		tasks_ch:     make(chan func()),
 		tasks_dyn_ch: make(chan func()),
 		limiter:      make(chan struct{}, max_pool_size),
@@ -36,7 +37,7 @@ func NewPool(min_pool_size, max_pool_size int, worker_annihilation_timeout time.
 	return p
 }
 
-func (p *pool) addworker(dynamic bool) {
+func (p *Pool) addworker(dynamic bool) {
 	go func() {
 		var timer *time.Timer
 		var tsk_ch chan func()
@@ -67,7 +68,7 @@ func (p *pool) addworker(dynamic bool) {
 }
 
 // no guaranties of scheduling after pool.Close() called
-func (p *pool) Schedule(task func()) {
+func (p *Pool) Schedule(task func()) {
 loop:
 	for {
 		select {
@@ -88,13 +89,13 @@ loop:
 	}
 }
 
-func (p *pool) ScheduleWithTimeout(task func(), timeout time.Duration) error {
+func (p *Pool) ScheduleWithTimeout(task func(), timeout time.Duration) error {
 	timer := time.NewTimer(timeout)
 loop:
 	for {
 		select {
 		case <-p.ctxdone: //TODO: пока выглядит СПОРНО
-			return errors.New("pool closed")
+			return ErrClosed
 		case <-timer.C:
 			return ErrTimeout
 		case p.tasks_ch <- task:
@@ -114,16 +115,16 @@ loop:
 	}
 }
 
-func (p *pool) Close() {
+func (p *Pool) Close() {
 	close(p.ctxdone)
 }
 
-func (p *pool) Done() {
+func (p *Pool) Done() {
 	for i := 0; i < len(p.limiter); i++ {
 		p.limiter <- struct{}{}
 	}
 }
-func (p *pool) DoneWithTimeout(timeout time.Duration) error {
+func (p *Pool) DoneWithTimeout(timeout time.Duration) error {
 	timer := time.NewTimer(timeout)
 loop:
 	for i := 0; i < len(p.limiter); i++ {
