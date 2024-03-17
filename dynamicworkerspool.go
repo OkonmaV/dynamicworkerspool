@@ -17,7 +17,24 @@ type Pool struct {
 	timeout time.Duration
 }
 
-func NewPool(min_pool_size, max_pool_size int, worker_annihilation_timeout time.Duration) *Pool {
+type GrtPooler interface {
+	GrtPoolerSheduler
+	GrtPoolerCloser
+}
+
+type GrtPoolerSheduler interface {
+	Schedule(task func())
+	ScheduleWithTimeout(task func(), timeout time.Duration) error
+}
+
+type GrtPoolerCloser interface {
+	Close()
+	IsClosed() bool
+	Done()
+	DoneWithTimeout(timeout time.Duration) error
+}
+
+func NewPool(min_pool_size, max_pool_size int, worker_annihilation_timeout time.Duration) GrtPooler {
 	if min_pool_size > max_pool_size || max_pool_size == 0 {
 		panic("pool sizes error: max size is zero or less than min size")
 	}
@@ -32,6 +49,7 @@ func NewPool(min_pool_size, max_pool_size int, worker_annihilation_timeout time.
 		timeout:      worker_annihilation_timeout,
 	}
 	for i := 0; i < min_pool_size; i++ {
+		p.limiter <- struct{}{}
 		p.addworker(false)
 	}
 	return p
@@ -59,6 +77,9 @@ func (p *Pool) addworker(dynamic bool) {
 			case task := <-tsk_ch:
 				task()
 				if dynamic {
+					if !timer.Stop() {
+						<-timer.C
+					}
 					timer.Reset(p.timeout)
 				}
 			}
@@ -74,16 +95,19 @@ loop:
 		select {
 		case <-p.ctxdone: //TODO: пока выглядит СПОРНО (если закрыли пул и все воркеры вмерли, то без этого будед дед лок, а сейчас нет гарантий выполнения задачи после закрытия пула)
 			return
-		case p.tasks_ch <- task:
-			return
 		default:
 			select {
-			case p.tasks_dyn_ch <- task:
+			case p.tasks_ch <- task:
 				return
-			case p.limiter <- struct{}{}:
-				p.addworker(true)
 			default:
-				continue loop
+				select {
+				case p.tasks_dyn_ch <- task:
+					return
+				case p.limiter <- struct{}{}:
+					p.addworker(true)
+				default:
+					continue loop
+				}
 			}
 		}
 	}
@@ -96,20 +120,23 @@ loop:
 		select {
 		case <-p.ctxdone: //TODO: пока выглядит СПОРНО
 			return ErrClosed
-		case <-timer.C:
-			return ErrTimeout
-		case p.tasks_ch <- task:
-			timer.Stop()
-			return nil
 		default:
 			select {
-			case p.tasks_dyn_ch <- task:
+			case <-timer.C:
+				return ErrTimeout
+			case p.tasks_ch <- task:
 				timer.Stop()
 				return nil
-			case p.limiter <- struct{}{}:
-				p.addworker(true)
 			default:
-				continue loop
+				select {
+				case p.tasks_dyn_ch <- task:
+					timer.Stop()
+					return nil
+				case p.limiter <- struct{}{}:
+					p.addworker(true)
+				default:
+					continue loop
+				}
 			}
 		}
 	}
@@ -117,6 +144,15 @@ loop:
 
 func (p *Pool) Close() {
 	close(p.ctxdone)
+}
+
+func (p *Pool) IsClosed() bool {
+	select {
+	case <-p.ctxdone:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *Pool) Done() {
